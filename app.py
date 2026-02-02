@@ -80,11 +80,13 @@ $$
     st.divider()
     with st.expander("관리자 모드"):
         admin_pw = st.text_input("관리자 비밀번호", type="password", key="admin_pw")
-        _correct_pw = ""
+        _correct_pw = os.getenv("ADMIN_PASSWORD", "")
         try:
-            _correct_pw = st.secrets["ADMIN_PASSWORD"]
+            _secret_pw = st.secrets.get("ADMIN_PASSWORD", "")
+            if _secret_pw:
+                _correct_pw = _secret_pw
         except Exception:
-            _correct_pw = os.getenv("ADMIN_PASSWORD", "")
+            pass
 
         if admin_pw and admin_pw == _correct_pw:
             st.success("관리자 인증 완료")
