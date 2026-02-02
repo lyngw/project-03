@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 docs_cache/
 .streamlit/secrets.toml
+cache/all_financials.pkl
+cache/all_financials_detail.pkl
+cache/corp_list.pkl

@@ -170,13 +170,18 @@ if collect_detail_btn:
 from datetime import datetime as _dt
 
 cache_path = os.path.join(CACHE_DIR, "all_financials.pkl")
-if not os.path.exists(cache_path):
-    st.info("좌측 사이드바에서 '데이터 수집/갱신' 버튼을 눌러 데이터를 먼저 수집해주세요.")
+metrics_cache_path = os.path.join(CACHE_DIR, "metrics.pkl")
+
+# metrics.pkl만 있어도 조회/분석 가능
+if not os.path.exists(cache_path) and not os.path.exists(metrics_cache_path):
+    st.info("좌측 사이드바에서 관리자 모드로 '데이터 수집/갱신' 버튼을 눌러 데이터를 먼저 수집해주세요.")
     st.stop()
 
 @st.cache_data(ttl=3600)
 def load_financials():
     """재무제표 로드 + 병합 + 연도 필터 (1시간 메모리 캐시)."""
+    if not os.path.exists(cache_path):
+        return pd.DataFrame()
     fin = pd.read_pickle(cache_path)
     detail_cache = os.path.join(CACHE_DIR, "all_financials_detail.pkl")
     if os.path.exists(detail_cache):
@@ -198,26 +203,27 @@ def load_financials():
 @st.cache_data(ttl=3600)
 def load_metrics(_fin_hash):
     """지표 계산 결과 캐시. 디스크 캐시도 활용."""
-    metrics_cache = os.path.join(CACHE_DIR, "metrics.pkl")
-    fin_mtime = os.path.getmtime(cache_path)
+    fin_mtime = os.path.getmtime(cache_path) if os.path.exists(cache_path) else 0
     detail_cache = os.path.join(CACHE_DIR, "all_financials_detail.pkl")
     detail_mtime = os.path.getmtime(detail_cache) if os.path.exists(detail_cache) else 0
 
     # 디스크 캐시가 재무제표보다 최신이면 바로 로드
-    if os.path.exists(metrics_cache):
-        m_mtime = os.path.getmtime(metrics_cache)
+    if os.path.exists(metrics_cache_path):
+        m_mtime = os.path.getmtime(metrics_cache_path)
         if m_mtime > fin_mtime and m_mtime > detail_mtime:
-            return pd.read_pickle(metrics_cache)
+            return pd.read_pickle(metrics_cache_path)
 
-    # 재계산
+    # 재계산 (원본 재무제표 필요)
     fin = load_financials()
+    if fin.empty:
+        return pd.DataFrame()
     m = compute_all_metrics(fin)
-    m.to_pickle(metrics_cache)
+    m.to_pickle(metrics_cache_path)
     return m
 
 financials = load_financials()
 # 해시값으로 데이터 변경 감지
-_fin_hash = os.path.getmtime(cache_path)
+_fin_hash = os.path.getmtime(cache_path) if os.path.exists(cache_path) else os.path.getmtime(metrics_cache_path)
 metrics = load_metrics(_fin_hash)
 
 if metrics.empty:
@@ -529,8 +535,12 @@ with tab_detail:
 
             # 연도별 재무상태표(자산부채표) 팝업
             st.subheader("연도별 재무상태표 상세")
-            available_years = sorted(corp_data["year"].unique())
-            selected_year = st.selectbox("연도 선택", available_years, index=len(available_years)-1, key="bs_year")
+            if financials.empty:
+                st.info("재무상태표 상세 데이터가 없습니다. 관리자 모드에서 데이터를 수집하면 확인할 수 있습니다.")
+                selected_year = None
+            else:
+                available_years = sorted(corp_data["year"].unique())
+                selected_year = st.selectbox("연도 선택", available_years, index=len(available_years)-1, key="bs_year")
 
             if selected_year:
                 corp_code = corp_data["corp_code"].iloc[0]
