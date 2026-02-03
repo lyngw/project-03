@@ -71,7 +71,14 @@ def compute_metrics_for_year(year_df: pd.DataFrame) -> dict:
     total_equity = _extract_amount(year_df, ["자본총계"])
 
     cash = _extract_amount(year_df, ["현금및현금성자산", "현금및현금등가물"])
-    short_term_borrowings = _extract_amount(year_df, ["단기차입금"])
+    # 더 구체적인 계정명을 먼저 검색 (부분매칭 방지)
+    short_term_borrowings = _extract_amount(year_df, [
+        "유동차입금(사채포함)",
+        "유동 차입금(사채 포함)",
+        "단기차입금(사채포함)",
+        "단기차입금",
+        "유동차입금",
+    ])
 
     # 자기자본: 직접 값 또는 계산
     if total_equity is None and total_assets is not None and total_liabilities is not None:
@@ -191,7 +198,14 @@ def compute_quarterly_net_cash(quarterly_df: pd.DataFrame) -> pd.DataFrame:
         if group["account_nm"].iloc[0] == "_NO_DATA_":
             continue
         cash = _extract_amount(group, ["현금및현금성자산", "현금및현금등가물"])
-        stb = _extract_amount(group, ["단기차입금"])
+        # 더 구체적인 계정명을 먼저 검색 (부분매칭 방지)
+        stb = _extract_amount(group, [
+            "유동차입금(사채포함)",
+            "유동 차입금(사채 포함)",
+            "단기차입금(사채포함)",
+            "단기차입금",
+            "유동차입금",
+        ])
         net_cash = 0.0
         if cash is not None:
             net_cash = cash
