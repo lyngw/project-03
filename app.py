@@ -271,7 +271,7 @@ if metrics.empty:
     st.stop()
 
 # --- 탭 구성 ---
-tab_roce, tab_debt, tab_netcash, tab_screener, tab_detail = st.tabs(["ROCE 스프레드시트", "부채비율 스프레드시트", "순현금 추이", "조건 검색", "개별 기업 분석"])
+tab_roce, tab_debt, tab_netcash, tab_detail = st.tabs(["ROCE 스프레드시트", "부채비율 스프레드시트", "순현금 추이", "개별 기업 분석"])
 
 # --- 순현금 추이 탭 ---
 with tab_netcash:
@@ -403,85 +403,6 @@ with tab_netcash:
                 )
             else:
                 st.info("조건에 해당하는 기업이 없습니다.")
-
-# --- 조건 검색 탭 ---
-with tab_screener:
-    st.subheader("조건 검색 (스크리너)")
-
-    # 최신 연도 데이터 기준
-    latest_year = int(metrics["year"].max())
-    latest_metrics = metrics[metrics["year"] == latest_year].copy()
-
-    st.caption(f"기준 연도: {latest_year}")
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        roce_range = st.slider(
-            "ROCE 범위 (%)", -100.0, 200.0, (20.0, 200.0), key="scr_roce"
-        )
-    with col2:
-        debt_range = st.slider(
-            "부채비율 범위 (%)", 0.0, 1000.0, (0.0, 100.0), key="scr_debt"
-        )
-    with col3:
-        name_search = st.text_input("기업명 검색", key="scr_name")
-
-    # 연속 조건: N년 연속 충족
-    consec_years = st.slider("최근 N년 연속 조건 충족", 1, years, 1, key="scr_consec")
-
-    if consec_years > 1:
-        # N년 연속 조건 충족 기업 필터
-        target_years = list(range(latest_year - consec_years + 1, latest_year + 1))
-        yearly = metrics[metrics["year"].isin(target_years)]
-        qualified = yearly.groupby("corp_code").apply(
-            lambda g: (
-                len(g) >= consec_years
-                and g["roce"].notna().all()
-                and g["debt_ratio"].notna().all()
-                and (g["roce"] >= roce_range[0]).all()
-                and (g["roce"] <= roce_range[1]).all()
-                and (g["debt_ratio"] >= debt_range[0]).all()
-                and (g["debt_ratio"] <= debt_range[1]).all()
-            )
-        )
-        qualified_corps = qualified[qualified].index.tolist()
-        screened = latest_metrics[latest_metrics["corp_code"].isin(qualified_corps)]
-    else:
-        screened = latest_metrics[
-            (latest_metrics["roce"] >= roce_range[0])
-            & (latest_metrics["roce"] <= roce_range[1])
-            & (latest_metrics["debt_ratio"] >= debt_range[0])
-            & (latest_metrics["debt_ratio"] <= debt_range[1])
-        ]
-
-    if name_search:
-        screened = screened[screened["corp_name"].str.contains(name_search, na=False)]
-
-    screened = screened.dropna(subset=["roce", "debt_ratio"])
-
-    st.metric("검색 결과", f"{len(screened)}개 기업")
-
-    display = screened[["corp_name", "roce", "debt_ratio", "ebit", "total_equity", "net_cash"]].copy()
-    display = display.rename(columns={
-        "corp_name": "기업명", "roce": "ROCE(%)", "debt_ratio": "부채비율(%)",
-        "ebit": "EBIT", "total_equity": "자기자본", "net_cash": "순현금",
-    }).sort_values("ROCE(%)", ascending=False)
-
-    st.dataframe(
-        display.style.format({
-            "ROCE(%)": "{:.1f}", "부채비율(%)": "{:.1f}",
-            "EBIT": "{:,.0f}", "자기자본": "{:,.0f}", "순현금": "{:,.0f}",
-        }, na_rep="-"),
-        use_container_width=True, height=500, hide_index=True,
-    )
-
-    st.download_button(
-        "검색 결과 CSV 다운로드",
-        display.to_csv(index=False).encode("utf-8-sig"),
-        "screener_result.csv",
-        "text/csv",
-        key="dl_screener",
-    )
 
 # --- ROCE 탭 ---
 with tab_roce:
