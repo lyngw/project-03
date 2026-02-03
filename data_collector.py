@@ -196,6 +196,89 @@ def fetch_all_detail_financials(
     return result
 
 
+def fetch_quarterly_net_cash(
+    dart: OpenDartReader,
+    corp_list: pd.DataFrame,
+    year: int | None = None,
+    progress_callback=None,
+) -> pd.DataFrame:
+    """최신 분기 재무제표에서 순현금(현금성자산-단기차입금) 수집.
+
+    Q3(11014) → Q2(반기, 11012) → Q1(11013) 순으로 시도하여
+    가장 최신 분기 데이터를 가져온다.
+    """
+    if year is None:
+        year = datetime.now().year - 1  # 직전 연도 (사업보고서 미제출 시)
+
+    cache_path = os.path.join(CACHE_DIR, f"quarterly_cash_{year}.pkl")
+
+    existing = pd.DataFrame()
+    if os.path.exists(cache_path):
+        existing = pd.read_pickle(cache_path)
+
+    collected = set()
+    if not existing.empty:
+        collected = set(existing["corp_code"].values)
+
+    quarter_codes = [
+        ("11014", "3Q"),
+        ("11012", "반기"),
+        ("11013", "1Q"),
+    ]
+
+    all_new = []
+    total = len(corp_list)
+
+    for i, (idx, row) in enumerate(corp_list.iterrows()):
+        corp_code = row["corp_code"]
+        corp_name = row.get("corp_name", "")
+        stock_code = row.get("stock_code", "")
+
+        if corp_code in collected:
+            if progress_callback:
+                progress_callback(i, total, f"{corp_name} (캐시)")
+            continue
+
+        if progress_callback:
+            progress_callback(i, total, corp_name)
+
+        found = False
+        for rcode, qlabel in quarter_codes:
+            try:
+                fs = dart.finstate_all(corp_code, year, reprt_code=rcode)
+                if fs is not None and not fs.empty:
+                    fs["year"] = year
+                    fs["quarter"] = qlabel
+                    fs["corp_code"] = corp_code
+                    fs["corp_name"] = corp_name
+                    fs["stock_code"] = stock_code
+                    all_new.append(fs)
+                    found = True
+                    break
+                time.sleep(0.15)
+            except Exception:
+                time.sleep(0.15)
+                continue
+        if not found:
+            # 수집 실패도 기록하여 재시도 방지
+            all_new.append(pd.DataFrame([{
+                "corp_code": corp_code, "corp_name": corp_name,
+                "stock_code": stock_code, "year": year,
+                "quarter": "N/A", "account_nm": "_NO_DATA_",
+            }]))
+
+    if all_new:
+        new_df = pd.concat(all_new, ignore_index=True)
+        result = pd.concat([existing, new_df], ignore_index=True) if not existing.empty else new_df
+    elif not existing.empty:
+        result = existing
+    else:
+        return pd.DataFrame()
+
+    result.to_pickle(cache_path)
+    return result
+
+
 def fetch_stock_price(stock_code: str, years: int = 10) -> pd.DataFrame:
     """개별 종목의 주가 데이터 조회."""
     start = f"{datetime.now().year - years}-01-01"

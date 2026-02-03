@@ -179,3 +179,43 @@ def pivot_debt_ratio(metrics_df: pd.DataFrame) -> pd.DataFrame:
     result = pivot.reset_index()
     result = result.join(impaired_pivot.reset_index(drop=True))
     return result
+
+
+def compute_quarterly_net_cash(quarterly_df: pd.DataFrame) -> pd.DataFrame:
+    """분기 재무제표에서 기업별 순현금을 계산."""
+    if quarterly_df.empty:
+        return pd.DataFrame()
+
+    results = []
+    for corp_code, group in quarterly_df.groupby("corp_code"):
+        if group["account_nm"].iloc[0] == "_NO_DATA_":
+            continue
+        cash = _extract_amount(group, ["현금및현금성자산", "현금및현금등가물"])
+        stb = _extract_amount(group, ["단기차입금"])
+        net_cash = 0.0
+        if cash is not None:
+            net_cash = cash
+        if stb is not None:
+            net_cash -= stb
+        quarter = group["quarter"].iloc[0]
+        results.append({
+            "corp_code": corp_code,
+            "corp_name": group["corp_name"].iloc[0],
+            "quarter": quarter,
+            "net_cash": net_cash,
+        })
+
+    return pd.DataFrame(results)
+
+
+def pivot_net_cash(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    """순현금을 기업×연도 피벗 테이블로 변환."""
+    if metrics_df.empty:
+        return pd.DataFrame()
+    pivot = metrics_df.pivot_table(
+        index=["corp_code", "corp_name"],
+        columns="year",
+        values="net_cash",
+    )
+    pivot.columns = [f"순현금_{int(y)}" for y in pivot.columns]
+    return pivot.reset_index()

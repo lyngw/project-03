@@ -6,8 +6,8 @@ import FinanceDataReader as fdr
 import os
 
 from config import DART_API_KEY, CACHE_DIR
-from data_collector import get_dart_reader, get_corp_list, fetch_all_financials, fetch_all_detail_financials, fetch_stock_price
-from analyzer import compute_all_metrics, pivot_roce, pivot_debt_ratio
+from data_collector import get_dart_reader, get_corp_list, fetch_all_financials, fetch_all_detail_financials, fetch_quarterly_net_cash, fetch_stock_price
+from analyzer import compute_all_metrics, pivot_roce, pivot_debt_ratio, pivot_net_cash, compute_quarterly_net_cash
 
 st.set_page_config(page_title="퀀트투자 분석 툴", layout="wide")
 
@@ -42,6 +42,7 @@ st.caption("ROCE · 부채비율 10년 추이 분석")
 api_key = DART_API_KEY
 collect_btn = False
 collect_detail_btn = False
+collect_qcash_btn = False
 
 with st.sidebar:
     st.header("설정")
@@ -93,6 +94,8 @@ $$
             collect_btn = st.button("데이터 수집/갱신 (요약)", type="primary", use_container_width=True)
             collect_detail_btn = st.button("전체 재무제표 수집", use_container_width=True,
                                             help="수집 성공 기업의 세부 계정과목(현금, 단기차입금 등)을 추가 수집")
+            collect_qcash_btn = st.button("최신 분기 순현금 수집", use_container_width=True,
+                                          help="직전 연도 최신 분기(3Q→반기→1Q) 순현금 수집")
             if os.path.exists(os.path.join(CACHE_DIR, "all_financials.pkl")):
                 if st.button("캐시 초기화"):
                     for f in os.listdir(CACHE_DIR):
@@ -168,6 +171,41 @@ if collect_detail_btn:
     else:
         st.warning("수집된 데이터가 없습니다.")
 
+# --- 최신 분기 순현금 수집 ---
+if collect_qcash_btn:
+    if not api_key:
+        st.error("DART API 키를 입력해주세요.")
+        st.stop()
+
+    dart = get_dart_reader(api_key)
+    corp_list_cache = os.path.join(CACHE_DIR, "corp_list.pkl")
+    if not os.path.exists(corp_list_cache):
+        st.error("먼저 '데이터 수집/갱신 (요약)' 을 실행해주세요.")
+        st.stop()
+
+    corp_list = pd.read_pickle(corp_list_cache)
+    from datetime import datetime as _dt_tmp
+    target_year = _dt_tmp.now().year - 1
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    def update_qcash_progress(idx, total, name):
+        progress_bar.progress(min((idx + 1) / max(total, 1), 1.0))
+        status_text.text(f"[{idx+1}/{total}] {name} 분기 순현금 수집 중...")
+
+    with st.spinner(f"{target_year}년 최신 분기 순현금 수집 중..."):
+        qcash = fetch_quarterly_net_cash(dart, corp_list, target_year, progress_callback=update_qcash_progress)
+
+    progress_bar.empty()
+    status_text.empty()
+
+    if not qcash.empty:
+        st.success(f"분기 순현금 수집 완료: {qcash['corp_name'].nunique()}개 기업")
+        st.cache_data.clear()
+    else:
+        st.warning("수집된 데이터가 없습니다.")
+
 # --- 캐시 데이터 로드 & 분석 ---
 from datetime import datetime as _dt
 
@@ -233,7 +271,138 @@ if metrics.empty:
     st.stop()
 
 # --- 탭 구성 ---
-tab_roce, tab_debt, tab_screener, tab_detail = st.tabs(["ROCE 스프레드시트", "부채비율 스프레드시트", "조건 검색", "개별 기업 분석"])
+tab_roce, tab_debt, tab_netcash, tab_screener, tab_detail = st.tabs(["ROCE 스프레드시트", "부채비율 스프레드시트", "순현금 추이", "조건 검색", "개별 기업 분석"])
+
+# --- 순현금 추이 탭 ---
+with tab_netcash:
+    st.subheader("전체 기업 순현금 추이 (억원)")
+    st.caption("순현금 = 현금및현금성자산 - 단기차입금")
+    netcash_pivot = pivot_net_cash(metrics)
+    if not netcash_pivot.empty:
+        nc_cols = [c for c in netcash_pivot.columns if c.startswith("순현금_")]
+        for c in nc_cols:
+            netcash_pivot[c] = netcash_pivot[c] / 1e8
+
+        # 분기 순현금 데이터 병합 (연간 데이터 없는 기업만)
+        latest_annual_year = int(metrics["year"].max())
+        qcash_cache = os.path.join(CACHE_DIR, f"quarterly_cash_{latest_annual_year + 1}.pkl")
+        if not os.path.exists(qcash_cache):
+            qcash_cache = os.path.join(CACHE_DIR, f"quarterly_cash_{latest_annual_year}.pkl")
+        if os.path.exists(qcash_cache):
+            qcash_raw = pd.read_pickle(qcash_cache)
+            qcash_year = int(os.path.basename(qcash_cache).replace("quarterly_cash_", "").replace(".pkl", ""))
+            qcash_metrics = compute_quarterly_net_cash(qcash_raw)
+            if not qcash_metrics.empty:
+                qcash_metrics["net_cash_q"] = qcash_metrics["net_cash"] / 1e8
+                q_col = f"순현금_{qcash_year}(최신분기)"
+                q_map = qcash_metrics.set_index("corp_code")[["net_cash_q", "quarter"]]
+                netcash_pivot = netcash_pivot.merge(q_map, left_on="corp_code", right_index=True, how="left")
+                # 연간 데이터가 없는 기업만 분기 값 표시, 있으면 그대로 분기도 표시
+                netcash_pivot[q_col] = netcash_pivot["net_cash_q"]
+                # 분기 라벨 추가
+                netcash_pivot[q_col + "_분기"] = netcash_pivot["quarter"]
+                netcash_pivot = netcash_pivot.drop(columns=["net_cash_q", "quarter"])
+                nc_cols = [c for c in netcash_pivot.columns if c.startswith("순현금_") and not c.endswith("_분기")]
+
+        col1, col2 = st.columns(2)
+        with col1:
+            search_nc = st.text_input("기업명 검색 (순현금)", key="nc_search")
+        with col2:
+            if nc_cols:
+                sort_order = st.selectbox("정렬 기준", ["최신 순현금 높은순", "최신 순현금 낮은순"], key="nc_sort")
+
+        filtered_nc = netcash_pivot.copy()
+        if search_nc:
+            filtered_nc = filtered_nc[filtered_nc["corp_name"].str.contains(search_nc, na=False)]
+        if nc_cols:
+            latest_nc = filtered_nc[nc_cols].ffill(axis=1).iloc[:, -1]
+            ascending = sort_order == "최신 순현금 낮은순"
+            filtered_nc = filtered_nc.assign(_sort=latest_nc).sort_values("_sort", ascending=ascending).drop(columns="_sort")
+
+        # 분기 라벨 컬럼 제거 (표시용)
+        display_nc_cols = [c for c in filtered_nc.columns if not c.endswith("_분기")]
+        fmt_cols = {c: "{:,.0f}" for c in display_nc_cols if c.startswith("순현금_")}
+
+        st.dataframe(
+            filtered_nc[display_nc_cols].style.format(fmt_cols, na_rep="-"),
+            use_container_width=True,
+            height=600,
+            hide_index=True,
+        )
+        st.download_button(
+            "CSV 다운로드",
+            filtered_nc[display_nc_cols].to_csv(index=False).encode("utf-8-sig"),
+            "net_cash_all.csv",
+            "text/csv",
+            key="dl_netcash",
+        )
+
+        # --- 주목할 기업: 순현금 급증 ---
+        st.divider()
+        st.subheader("주목할 기업 — 순현금 급증")
+        st.caption("최신 순현금이 이전 3개년 평균 대비 30% 이상 증가한 기업")
+
+        # 연간 순현금 컬럼에서 이전 3년 평균 계산
+        annual_nc_cols = [c for c in nc_cols if "(최신분기)" not in c]
+        q_col_name = [c for c in nc_cols if "(최신분기)" in c]
+
+        if len(annual_nc_cols) >= 4:
+            prev_3y_cols = annual_nc_cols[-4:-1]  # 최신 연간 제외, 그 이전 3년
+            latest_col = annual_nc_cols[-1]
+        elif len(annual_nc_cols) >= 2:
+            prev_3y_cols = annual_nc_cols[:-1]
+            latest_col = annual_nc_cols[-1]
+        else:
+            prev_3y_cols = []
+            latest_col = annual_nc_cols[-1] if annual_nc_cols else None
+
+        if prev_3y_cols and latest_col:
+            spotlight = netcash_pivot.copy()
+            spotlight["이전3년평균"] = spotlight[prev_3y_cols].mean(axis=1)
+            # 최신값: 분기 데이터가 있으면 분기 우선, 없으면 연간
+            if q_col_name:
+                spotlight["최신순현금"] = spotlight[q_col_name[0]].fillna(spotlight[latest_col])
+                spotlight["기준"] = spotlight.apply(
+                    lambda r: r.get(q_col_name[0] + "_분기", "") if pd.notna(r[q_col_name[0]]) else f"{latest_col.replace('순현금_', '')}년 연간",
+                    axis=1,
+                )
+            else:
+                spotlight["최신순현금"] = spotlight[latest_col]
+                spotlight["기준"] = f"{latest_col.replace('순현금_', '')}년 연간"
+
+            # 3년 평균 양수 & 최신값 존재
+            valid = spotlight.dropna(subset=["최신순현금", "이전3년평균"])
+            valid = valid[valid["이전3년평균"] > 0]
+            valid["증가율(%)"] = (valid["최신순현금"] - valid["이전3년평균"]) / valid["이전3년평균"] * 100
+
+            threshold = st.slider("최소 증가율 (%)", 30, 500, 30, step=10, key="nc_threshold")
+            notable = valid[valid["증가율(%)"] >= threshold].sort_values("증가율(%)", ascending=False)
+
+            st.metric("해당 기업 수", f"{len(notable)}개")
+
+            if not notable.empty:
+                notable_display = notable[["corp_name", "이전3년평균", "최신순현금", "증가율(%)", "기준"]].copy()
+                notable_display.columns = ["기업명", "이전3년평균(억)", "최신순현금(억)", "증가율(%)", "기준"]
+
+                st.dataframe(
+                    notable_display.style.format({
+                        "이전3년평균(억)": "{:,.0f}",
+                        "최신순현금(억)": "{:,.0f}",
+                        "증가율(%)": "{:,.0f}",
+                    }, na_rep="-"),
+                    use_container_width=True,
+                    height=500,
+                    hide_index=True,
+                )
+                st.download_button(
+                    "주목 기업 CSV 다운로드",
+                    notable_display.to_csv(index=False).encode("utf-8-sig"),
+                    "notable_net_cash.csv",
+                    "text/csv",
+                    key="dl_notable_nc",
+                )
+            else:
+                st.info("조건에 해당하는 기업이 없습니다.")
 
 # --- 조건 검색 탭 ---
 with tab_screener:
