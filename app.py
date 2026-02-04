@@ -11,6 +11,46 @@ from analyzer import compute_all_metrics, pivot_roce, pivot_debt_ratio, pivot_ne
 
 st.set_page_config(page_title="퀀트투자 분석 툴", layout="wide")
 
+# --- 영문 약어 → 한글 변환 (검색용) ---
+ABBREV_MAP = {
+    "SK": "에스케이", "LG": "엘지", "KT": "케이티", "CJ": "씨제이",
+    "GS": "지에스", "LS": "엘에스", "HD": "에이치디", "DB": "디비",
+    "KB": "케이비", "NH": "엔에이치", "DL": "디엘", "HL": "에이치엘",
+    "OCI": "오씨아이", "BGF": "비지에프", "KCC": "케이씨씨",
+    "SDN": "에스디엔", "KPX": "케이피엑스", "HLB": "에이치엘비",
+    "JW": "제이더블유", "AK": "에이케이", "DI": "디아이",
+}
+
+def expand_search(query: str) -> list[str]:
+    """검색어를 확장: 영문 약어 → 한글 변환 포함."""
+    if not query:
+        return []
+    queries = [query]
+    upper = query.upper()
+    # 영문 약어가 포함되어 있으면 한글 버전도 추가
+    for eng, kor in ABBREV_MAP.items():
+        if eng in upper:
+            converted = query.replace(eng, kor).replace(eng.lower(), kor)
+            if converted not in queries:
+                queries.append(converted)
+    # 한글이 포함되어 있으면 영문 버전도 추가 (역방향)
+    for eng, kor in ABBREV_MAP.items():
+        if kor in query:
+            converted = query.replace(kor, eng)
+            if converted not in queries:
+                queries.append(converted)
+    return queries
+
+def search_filter(df: pd.DataFrame, col: str, query: str) -> pd.DataFrame:
+    """확장된 검색어로 DataFrame 필터링."""
+    if not query:
+        return df
+    queries = expand_search(query)
+    mask = pd.Series(False, index=df.index)
+    for q in queries:
+        mask |= df[col].str.contains(q, na=False, case=False)
+    return df[mask]
+
 # --- 모바일 최적화 CSS ---
 st.markdown("""
 <style>
@@ -313,7 +353,7 @@ with tab_netcash:
 
         filtered_nc = netcash_pivot.copy()
         if search_nc:
-            filtered_nc = filtered_nc[filtered_nc["corp_name"].str.contains(search_nc, na=False)]
+            filtered_nc = search_filter(filtered_nc, "corp_name", search_nc)
         if nc_cols:
             latest_nc = filtered_nc[nc_cols].ffill(axis=1).iloc[:, -1]
             ascending = sort_order == "최신 순현금 낮은순"
@@ -421,7 +461,7 @@ with tab_roce:
 
         filtered = roce_pivot.copy()
         if search:
-            filtered = filtered[filtered["corp_name"].str.contains(search, na=False)]
+            filtered = search_filter(filtered, "corp_name", search)
         if roce_cols:
             # 각 기업의 가장 최근 ROCE 값으로 필터링 (NaN 무시)
             latest_roce = filtered[roce_cols].ffill(axis=1).iloc[:, -1]
@@ -516,7 +556,7 @@ with tab_debt:
 
         filtered_d = debt_pivot.copy()
         if search_d:
-            filtered_d = filtered_d[filtered_d["corp_name"].str.contains(search_d, na=False)]
+            filtered_d = search_filter(filtered_d, "corp_name", search_d)
         if debt_cols:
             latest_debt = filtered_d[debt_cols].ffill(axis=1).iloc[:, -1]
             filtered_d = filtered_d[latest_debt <= max_debt]
@@ -562,9 +602,18 @@ with tab_debt:
 with tab_detail:
     st.subheader("개별 기업 상세 분석")
     corp_names = sorted(metrics["corp_name"].unique())
-    selected = st.selectbox("기업 선택", corp_names)
 
-    if selected:
+    # 기업 검색 (영문 약어 자동 변환)
+    search_detail = st.text_input("기업명 검색", key="detail_search", placeholder="SK바이오팜 → 에스케이바이오팜 자동 변환")
+    if search_detail:
+        queries = expand_search(search_detail)
+        filtered_names = [n for n in corp_names if any(q.lower() in n.lower() for q in queries)]
+    else:
+        filtered_names = corp_names
+
+    selected = st.selectbox("기업 선택", filtered_names if filtered_names else ["검색 결과 없음"])
+
+    if selected and selected != "검색 결과 없음":
         corp_data = metrics[metrics["corp_name"] == selected].sort_values("year")
 
         if corp_data.empty:
