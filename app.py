@@ -1010,7 +1010,7 @@ with tab_detail:
                         pass
 
                     # fallback: 연간 사업보고서
-                    if ttm_ni is None:
+                    if ttm_ni is None and not financials.empty:
                         latest_year_data = corp_data.sort_values("year", ascending=False).iloc[0]
                         _ly = int(latest_year_data["year"])
                         _fs = financials[
