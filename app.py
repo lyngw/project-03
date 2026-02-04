@@ -645,6 +645,135 @@ with tab_detail:
             fig.update_yaxes(title_text="부채비율 (%)", secondary_y=True)
             st.plotly_chart(fig, use_container_width=True)
 
+            # --- 자동 분석 요약 ---
+            st.subheader("분석 요약")
+
+            latest = corp_data.iloc[-1]
+            first = corp_data.iloc[0]
+            stock_code = str(latest.get("stock_code", "")).zfill(6) if pd.notna(latest.get("stock_code")) else None
+
+            # 주가 및 시가총액 조회
+            marcap = None
+            current_price = None
+            price_chg_1m = None
+            price_chg_1y = None
+            if stock_code and stock_code != "000000":
+                try:
+                    krx_list = fdr.StockListing("KRX")
+                    krx_row = krx_list[krx_list["Code"] == stock_code]
+                    if not krx_row.empty and "Marcap" in krx_row.columns:
+                        marcap = krx_row["Marcap"].iloc[0]
+                    price_df = fdr.DataReader(stock_code, "2024-01-01")
+                    if not price_df.empty:
+                        current_price = price_df["Close"].iloc[-1]
+                        if len(price_df) >= 20:
+                            price_chg_1m = (current_price / price_df["Close"].iloc[-20] - 1) * 100
+                        if len(price_df) >= 250:
+                            price_chg_1y = (current_price / price_df["Close"].iloc[-250] - 1) * 100
+                except:
+                    pass
+
+            # 핵심 지표
+            latest_roce = latest.get("roce")
+            latest_debt = latest.get("debt_ratio")
+            latest_nc = latest.get("net_cash")
+            latest_equity = latest.get("total_equity")
+            latest_ebit = latest.get("ebit")
+            first_equity = first.get("total_equity")
+
+            # 분석 포인트 생성
+            highlights = []
+            warnings = []
+
+            # ROCE 분석
+            if pd.notna(latest_roce):
+                if latest_roce >= 20:
+                    highlights.append(f"ROCE {latest_roce:.1f}%로 우수한 자본효율성")
+                elif latest_roce >= 10:
+                    highlights.append(f"ROCE {latest_roce:.1f}%로 양호한 수준")
+                elif latest_roce < 0:
+                    warnings.append(f"ROCE {latest_roce:.1f}%로 영업적자 상태")
+
+            # 부채비율 분석
+            if pd.notna(latest_debt):
+                if latest_debt <= 50:
+                    highlights.append(f"부채비율 {latest_debt:.0f}%로 재무구조 탄탄")
+                elif latest_debt <= 100:
+                    highlights.append(f"부채비율 {latest_debt:.0f}%로 적정 수준")
+                elif latest_debt > 200:
+                    warnings.append(f"부채비율 {latest_debt:.0f}%로 재무 부담")
+
+            # 순현금 분석
+            latest_stb = latest.get("short_term_borrowings")
+            if pd.notna(latest_nc):
+                if latest_nc > 0:
+                    if pd.notna(latest_stb) and latest_stb == 0:
+                        highlights.append(f"순현금 {latest_nc/1e8:,.0f}억원 (무차입 경영)")
+                    else:
+                        highlights.append(f"순현금 {latest_nc/1e8:,.0f}억원 보유")
+                else:
+                    warnings.append(f"순부채 {abs(latest_nc)/1e8:,.0f}억원")
+
+            # 자기자본 성장
+            if pd.notna(latest_equity) and pd.notna(first_equity) and first_equity > 0:
+                equity_growth = latest_equity / first_equity
+                years = int(latest["year"]) - int(first["year"])
+                if years > 0 and equity_growth >= 2:
+                    highlights.append(f"자기자본 {years}년간 {equity_growth:.1f}배 성장")
+
+            # EBIT 성장 (최근 2년 비교)
+            if len(corp_data) >= 2:
+                prev = corp_data.iloc[-2]
+                prev_ebit = prev.get("ebit")
+                if pd.notna(latest_ebit) and pd.notna(prev_ebit) and prev_ebit > 0:
+                    ebit_growth = (latest_ebit / prev_ebit - 1) * 100
+                    if ebit_growth >= 50:
+                        highlights.append(f"EBIT 전년 대비 {ebit_growth:.0f}% 성장")
+                    elif ebit_growth <= -30:
+                        warnings.append(f"EBIT 전년 대비 {abs(ebit_growth):.0f}% 감소")
+
+            # 주가 모멘텀
+            if price_chg_1m is not None and price_chg_1m >= 20:
+                highlights.append(f"최근 1개월 주가 {price_chg_1m:+.0f}% 상승")
+
+            # 밸류에이션 계산
+            pbr = None
+            ev_ebit = None
+            if marcap and pd.notna(latest_equity) and latest_equity > 0:
+                pbr = marcap / latest_equity
+            if marcap and pd.notna(latest_ebit) and latest_ebit > 0 and pd.notna(latest_nc):
+                ev = marcap - latest_nc
+                ev_ebit = ev / latest_ebit
+
+            # 화면 출력
+            col_left, col_right = st.columns(2)
+
+            with col_left:
+                st.markdown("**핵심 포인트**")
+                if highlights:
+                    for h in highlights:
+                        st.markdown(f"- ✅ {h}")
+                if warnings:
+                    for w in warnings:
+                        st.markdown(f"- ⚠️ {w}")
+                if not highlights and not warnings:
+                    st.markdown("- 분석 데이터 부족")
+
+            with col_right:
+                st.markdown("**밸류에이션**")
+                if current_price:
+                    st.markdown(f"- 현재가: **{current_price:,.0f}원**")
+                if marcap:
+                    st.markdown(f"- 시가총액: **{marcap/1e8:,.0f}억원**")
+                if pbr:
+                    pbr_eval = "저평가" if pbr < 1 else ("적정" if pbr < 3 else "고평가")
+                    st.markdown(f"- PBR: **{pbr:.2f}배** ({pbr_eval})")
+                if ev_ebit:
+                    ev_eval = "저평가" if ev_ebit < 10 else ("적정" if ev_ebit < 20 else "고평가")
+                    st.markdown(f"- EV/EBIT: **{ev_ebit:.1f}배** ({ev_eval})")
+
+            st.divider()
+
             # 상세 테이블 (천단위 쉼표)
             display_cols = ["year", "ebit", "total_assets", "total_liabilities", "total_equity",
                             "cash", "short_term_borrowings", "net_cash", "roce", "debt_ratio"]
