@@ -60,7 +60,7 @@ def compute_metrics_for_year(year_df: pd.DataFrame) -> dict:
     """한 기업의 1개년 재무제표에서 ROCE와 부채비율 계산.
 
     ROCE = EBIT / (자기자본 - 순현금)
-    순현금 = 현금및현금성자산 - 단기차입금
+    순현금 = 현금및현금성자산 + 단기금융상품 - 단기차입금
     부채비율 = 총부채 / 자기자본 × 100
     """
     ebit = _extract_amount(year_df, ["영업이익", "영업손익"])
@@ -71,6 +71,7 @@ def compute_metrics_for_year(year_df: pd.DataFrame) -> dict:
     total_equity = _extract_amount(year_df, ["자본총계"])
 
     cash = _extract_amount(year_df, ["현금및현금성자산", "현금및현금등가물"])
+    short_term_financial = _extract_amount(year_df, ["단기금융상품"])
     # 더 구체적인 계정명을 먼저 검색 (부분매칭 방지)
     short_term_borrowings = _extract_amount(year_df, [
         "유동차입금(사채포함)",
@@ -84,10 +85,12 @@ def compute_metrics_for_year(year_df: pd.DataFrame) -> dict:
     if total_equity is None and total_assets is not None and total_liabilities is not None:
         total_equity = total_assets - total_liabilities
 
-    # 순현금 계산
+    # 순현금 계산 (현금 + 단기금융상품 - 단기차입금)
     net_cash = 0.0
     if cash is not None:
-        net_cash = cash
+        net_cash += cash
+    if short_term_financial is not None:
+        net_cash += short_term_financial
     if short_term_borrowings is not None:
         net_cash -= short_term_borrowings
 
@@ -198,6 +201,7 @@ def compute_quarterly_net_cash(quarterly_df: pd.DataFrame) -> pd.DataFrame:
         if group["account_nm"].iloc[0] == "_NO_DATA_":
             continue
         cash = _extract_amount(group, ["현금및현금성자산", "현금및현금등가물"])
+        short_term_financial = _extract_amount(group, ["단기금융상품"])
         # 더 구체적인 계정명을 먼저 검색 (부분매칭 방지)
         stb = _extract_amount(group, [
             "유동차입금(사채포함)",
@@ -206,9 +210,12 @@ def compute_quarterly_net_cash(quarterly_df: pd.DataFrame) -> pd.DataFrame:
             "단기차입금",
             "유동차입금",
         ])
+        # 순현금 = 현금 + 단기금융상품 - 단기차입금
         net_cash = 0.0
         if cash is not None:
-            net_cash = cash
+            net_cash += cash
+        if short_term_financial is not None:
+            net_cash += short_term_financial
         if stb is not None:
             net_cash -= stb
         quarter = group["quarter"].iloc[0]
