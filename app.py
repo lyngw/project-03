@@ -4,10 +4,35 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import FinanceDataReader as fdr
 import os
+import pickle
 
 from config import DART_API_KEY, CACHE_DIR
+
+
+class _NumpyCompatUnpickler(pickle.Unpickler):
+    """numpy 버전 호환 unpickler (numpy._core → numpy.core 매핑)"""
+    def find_class(self, module, name):
+        if module.startswith("numpy._core"):
+            module = module.replace("numpy._core", "numpy.core", 1)
+        return super().find_class(module, name)
+
+
+def _read_pickle_compat(path):
+    """numpy 호환 pickle 로드 (pd.read_pickle 대체)"""
+    with open(path, "rb") as f:
+        return _NumpyCompatUnpickler(f).load()
 from data_collector import get_dart_reader, get_corp_list, fetch_all_financials, fetch_all_detail_financials, fetch_quarterly_net_cash, fetch_stock_price
 from analyzer import compute_all_metrics, pivot_roce, pivot_debt_ratio, pivot_net_cash, compute_quarterly_net_cash
+from leading_indicators import (
+    fetch_oecd_indicators, fetch_conference_board_indicators, fetch_korea_indicators,
+    get_latest_values, get_indicator_history
+)
+from ai_regime import (
+    KOSPI200_SECTOR_MAP, build_sector_dataframe,
+    fetch_sector_prices, compute_regime_momentum,
+    plot_sensitivity_bar, plot_position_treemap, plot_regime_scatter,
+    plot_displacement_spiral, plot_scenario_timeline,
+)
 
 st.set_page_config(page_title="퀀트투자 분석 툴", layout="wide")
 
@@ -190,7 +215,7 @@ if collect_detail_btn:
         st.stop()
 
     dart = get_dart_reader(api_key)
-    base_fin = pd.read_pickle(base_cache)
+    base_fin = _read_pickle_compat(base_cache)
 
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -223,7 +248,7 @@ if collect_qcash_btn:
         st.error("먼저 '데이터 수집/갱신 (요약)' 을 실행해주세요.")
         st.stop()
 
-    corp_list = pd.read_pickle(corp_list_cache)
+    corp_list = _read_pickle_compat(corp_list_cache)
     from datetime import datetime as _dt_tmp
     target_year = _dt_tmp.now().year - 1
 
@@ -262,10 +287,10 @@ def load_financials():
     """재무제표 로드 + 병합 + 연도 필터 (1시간 메모리 캐시)."""
     if not os.path.exists(cache_path):
         return pd.DataFrame()
-    fin = pd.read_pickle(cache_path)
+    fin = _read_pickle_compat(cache_path)
     detail_cache = os.path.join(CACHE_DIR, "all_financials_detail.pkl")
     if os.path.exists(detail_cache):
-        detail = pd.read_pickle(detail_cache)
+        detail = _read_pickle_compat(detail_cache)
         # BS(재무상태표)와 CIS(손익계산서)만 사용 (SCE자본변동표, CF현금흐름표 제외)
         # SCE에 동일 계정명이 다른 값으로 존재하여 덮어쓰기 문제 발생 방지
         if "sj_div" in detail.columns:
@@ -291,7 +316,7 @@ def load_metrics(_fin_hash):
     if os.path.exists(metrics_cache_path):
         m_mtime = os.path.getmtime(metrics_cache_path)
         if m_mtime > fin_mtime and m_mtime > detail_mtime:
-            return pd.read_pickle(metrics_cache_path)
+            return _read_pickle_compat(metrics_cache_path)
 
     # 재계산 (원본 재무제표 필요)
     fin = load_financials()
@@ -311,7 +336,7 @@ if metrics.empty:
     st.stop()
 
 # --- 탭 구성 ---
-tab_roce, tab_debt, tab_netcash, tab_detail = st.tabs(["ROCE 스프레드시트", "부채비율 스프레드시트", "순현금 추이", "개별 기업 분석"])
+tab_roce, tab_debt, tab_netcash, tab_detail, tab_leading, tab_regime = st.tabs(["ROCE 스프레드시트", "부채비율 스프레드시트", "순현금 추이", "개별 기업 분석", "경기선행지수", "🤖 AI Regime"])
 
 # --- 순현금 추이 탭 ---
 with tab_netcash:
@@ -329,7 +354,7 @@ with tab_netcash:
         if not os.path.exists(qcash_cache):
             qcash_cache = os.path.join(CACHE_DIR, f"quarterly_cash_{latest_annual_year}.pkl")
         if os.path.exists(qcash_cache):
-            qcash_raw = pd.read_pickle(qcash_cache)
+            qcash_raw = _read_pickle_compat(qcash_cache)
             qcash_year = int(os.path.basename(qcash_cache).replace("quarterly_cash_", "").replace(".pkl", ""))
             qcash_metrics = compute_quarterly_net_cash(qcash_raw)
             if not qcash_metrics.empty:
@@ -1055,3 +1080,522 @@ with tab_detail:
                     ))
                     fig_price.update_layout(title=f"{selected} 주가 추이", height=350)
                     st.plotly_chart(fig_price, use_container_width=True)
+
+# --- 경기선행지수 탭 ---
+with tab_leading:
+    st.subheader("경기선행지수 모니터링")
+    st.caption("OECD, 컨퍼런스보드, 한국 경기선행지수의 금융시장 관련 구성요소")
+
+    # API 키 확인
+    fred_key = os.getenv("FRED_API_KEY", "")
+    bok_key = os.getenv("BOK_API_KEY", "")
+    try:
+        fred_key = st.secrets.get("FRED_API_KEY", fred_key)
+        bok_key = st.secrets.get("BOK_API_KEY", bok_key)
+    except Exception:
+        pass
+
+    # 환경변수로 전달 (leading_indicators 모듈에서 사용)
+    if fred_key:
+        os.environ["FRED_API_KEY"] = fred_key
+    if bok_key:
+        os.environ["BOK_API_KEY"] = bok_key
+
+    if not fred_key and not bok_key:
+        st.warning("FRED_API_KEY 또는 BOK_API_KEY가 설정되지 않았습니다. 환경변수 또는 Streamlit Secrets에 API 키를 설정해주세요.")
+        st.info("""
+**API 키 발급 안내**
+- FRED API: https://fred.stlouisfed.org/docs/api/api_key.html (무료)
+- 한국은행 ECOS API: https://ecos.bok.or.kr/api/ (무료)
+        """)
+
+    # 3개 섹션으로 구분
+    st.markdown("---")
+
+    # 1. OECD 경기선행지수
+    st.markdown("### OECD 경기선행지수 (금융시장 구성요소)")
+    st.caption("주가지수, 단기금리, 장단기 금리차")
+
+    if fred_key:
+        with st.spinner("OECD 지표 조회 중..."):
+            oecd_indicators = fetch_oecd_indicators()
+
+        if oecd_indicators:
+            oecd_latest = get_latest_values(oecd_indicators)
+            if not oecd_latest.empty:
+                # 변화 방향 표시
+                def format_change(row):
+                    if pd.isna(row["변화"]):
+                        return "-"
+                    arrow = "▲" if row["변화"] > 0 else ("▼" if row["변화"] < 0 else "─")
+                    color = "red" if row["변화"] > 0 else ("blue" if row["변화"] < 0 else "gray")
+                    return f"{arrow} {row['변화']:+.2f}"
+
+                oecd_display = oecd_latest.copy()
+                oecd_display["변화"] = oecd_display.apply(format_change, axis=1)
+                oecd_display["변화율(%)"] = oecd_display["변화율(%)"].apply(
+                    lambda x: f"{x:+.2f}%" if pd.notna(x) else "-"
+                )
+                oecd_display["최신값"] = oecd_display["최신값"].apply(lambda x: f"{x:,.2f}")
+                oecd_display["전월값"] = oecd_display["전월값"].apply(
+                    lambda x: f"{x:,.2f}" if pd.notna(x) else "-"
+                )
+
+                st.dataframe(
+                    oecd_display[["지표", "최신값", "기준일", "변화", "변화율(%)"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            # 차트 - 주가지수와 금리 지표 분리 (스케일 차이)
+            oecd_history = get_indicator_history(oecd_indicators, months=36)
+            if not oecd_history.empty:
+                # 주가지수와 금리 지표 분리
+                price_cols = [c for c in oecd_history.columns if "S&P" in c or "주가" in c]
+                rate_cols = [c for c in oecd_history.columns if c not in price_cols]
+
+                # 주가지수 차트
+                if price_cols:
+                    fig_oecd_price = go.Figure()
+                    for col in price_cols:
+                        fig_oecd_price.add_trace(go.Scatter(
+                            x=oecd_history.index, y=oecd_history[col],
+                            mode="lines", name=col,
+                            line=dict(color="steelblue"),
+                        ))
+                    fig_oecd_price.update_layout(
+                        title="OECD - 주가지수 (S&P 500)",
+                        height=300,
+                        yaxis_title="지수",
+                    )
+                    st.plotly_chart(fig_oecd_price, use_container_width=True)
+
+                # 금리 지표 차트
+                if rate_cols:
+                    fig_oecd_rate = go.Figure()
+                    colors = ["tomato", "green"]
+                    for i, col in enumerate(rate_cols):
+                        fig_oecd_rate.add_trace(go.Scatter(
+                            x=oecd_history.index, y=oecd_history[col],
+                            mode="lines", name=col,
+                            line=dict(color=colors[i % len(colors)]),
+                        ))
+                    fig_oecd_rate.update_layout(
+                        title="OECD - 금리 지표",
+                        height=300,
+                        yaxis_title="금리 (%)",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                    )
+                    # 장단기 금리차 0선 표시
+                    fig_oecd_rate.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+                    st.plotly_chart(fig_oecd_rate, use_container_width=True)
+        else:
+            st.info("OECD 지표 데이터를 불러올 수 없습니다.")
+    else:
+        st.info("FRED API 키가 필요합니다.")
+
+    st.markdown("---")
+
+    # 2. 컨퍼런스보드 경기선행지수
+    st.markdown("### 컨퍼런스보드 경기선행지수 (금융시장 구성요소)")
+    st.caption("S&P 500, 실질 M2 통화공급, 장단기 금리차")
+
+    if fred_key:
+        with st.spinner("컨퍼런스보드 지표 조회 중..."):
+            cb_indicators = fetch_conference_board_indicators()
+
+        if cb_indicators:
+            cb_latest = get_latest_values(cb_indicators)
+            if not cb_latest.empty:
+                cb_display = cb_latest.copy()
+                cb_display["변화"] = cb_display.apply(
+                    lambda row: f"{'▲' if row['변화'] > 0 else ('▼' if row['변화'] < 0 else '─')} {row['변화']:+.2f}" if pd.notna(row["변화"]) else "-",
+                    axis=1
+                )
+                cb_display["변화율(%)"] = cb_display["변화율(%)"].apply(
+                    lambda x: f"{x:+.2f}%" if pd.notna(x) else "-"
+                )
+                cb_display["최신값"] = cb_display["최신값"].apply(lambda x: f"{x:,.2f}")
+                cb_display["전월값"] = cb_display["전월값"].apply(
+                    lambda x: f"{x:,.2f}" if pd.notna(x) else "-"
+                )
+
+                st.dataframe(
+                    cb_display[["지표", "최신값", "기준일", "변화", "변화율(%)"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            # 차트 - 주가/M2와 금리 지표 분리 (스케일 차이)
+            cb_history = get_indicator_history(cb_indicators, months=36)
+            if not cb_history.empty:
+                # 대형 스케일과 금리 지표 분리
+                large_cols = [c for c in cb_history.columns if "S&P" in c or "M2" in c]
+                rate_cols = [c for c in cb_history.columns if "금리" in c]
+
+                # S&P 500 & 실질 M2 차트 (듀얼 축)
+                if large_cols:
+                    fig_cb_large = make_subplots(specs=[[{"secondary_y": True}]])
+                    colors = {"S&P 500": "purple", "실질 M2 통화공급": "orange"}
+                    for col in large_cols:
+                        secondary = "M2" in col
+                        fig_cb_large.add_trace(
+                            go.Scatter(
+                                x=cb_history.index, y=cb_history[col],
+                                mode="lines", name=col,
+                                line=dict(color=colors.get(col, "gray")),
+                            ),
+                            secondary_y=secondary,
+                        )
+                    fig_cb_large.update_layout(
+                        title="컨퍼런스보드 - S&P 500 & 실질 M2",
+                        height=300,
+                    )
+                    fig_cb_large.update_yaxes(title_text="S&P 500", secondary_y=False)
+                    fig_cb_large.update_yaxes(title_text="실질 M2", secondary_y=True)
+                    st.plotly_chart(fig_cb_large, use_container_width=True)
+
+                # 금리 지표 차트
+                if rate_cols:
+                    fig_cb_rate = go.Figure()
+                    for col in rate_cols:
+                        fig_cb_rate.add_trace(go.Scatter(
+                            x=cb_history.index, y=cb_history[col],
+                            mode="lines", name=col,
+                            line=dict(color="teal"),
+                        ))
+                    fig_cb_rate.update_layout(
+                        title="컨퍼런스보드 - 장단기 금리차",
+                        height=300,
+                        yaxis_title="금리차 (%)",
+                    )
+                    fig_cb_rate.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+                    st.plotly_chart(fig_cb_rate, use_container_width=True)
+        else:
+            st.info("컨퍼런스보드 지표 데이터를 불러올 수 없습니다.")
+    else:
+        st.info("FRED API 키가 필요합니다.")
+
+    st.markdown("---")
+
+    # 3. 한국 경기선행지수
+    st.markdown("### 한국 경기선행지수 (금융시장 구성요소)")
+    st.caption("경제심리지수, 국제원자재가격, KOSPI, 장단기 금리차")
+
+    with st.spinner("한국 경기선행지수 조회 중..."):
+        kr_indicators = fetch_korea_indicators()
+
+    if kr_indicators:
+        kr_latest = get_latest_values(kr_indicators)
+        if not kr_latest.empty:
+            kr_display = kr_latest.copy()
+            kr_display["변화"] = kr_display.apply(
+                lambda row: f"{'▲' if row['변화'] > 0 else ('▼' if row['변화'] < 0 else '─')} {row['변화']:+.2f}" if pd.notna(row["변화"]) else "-",
+                axis=1
+            )
+            kr_display["변화율(%)"] = kr_display["변화율(%)"].apply(
+                lambda x: f"{x:+.2f}%" if pd.notna(x) else "-"
+            )
+            kr_display["최신값"] = kr_display["최신값"].apply(lambda x: f"{x:,.2f}")
+            kr_display["전월값"] = kr_display["전월값"].apply(
+                lambda x: f"{x:,.2f}" if pd.notna(x) else "-"
+            )
+
+            st.dataframe(
+                kr_display[["지표", "최신값", "기준일", "변화", "변화율(%)"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        # 차트
+        kr_history = get_indicator_history(kr_indicators, months=36)
+        if not kr_history.empty:
+            # KOSPI는 스케일이 다르므로 별도 축 사용
+            fig_kr = make_subplots(specs=[[{"secondary_y": True}]])
+
+            colors = ["navy", "crimson", "darkgreen", "darkorange"]
+            for i, col in enumerate(kr_history.columns):
+                secondary = col == "KOSPI"
+                fig_kr.add_trace(
+                    go.Scatter(
+                        x=kr_history.index, y=kr_history[col],
+                        mode="lines", name=col,
+                        line=dict(color=colors[i % len(colors)]),
+                    ),
+                    secondary_y=secondary,
+                )
+
+            fig_kr.update_layout(
+                title="한국 경기선행지수 구성요소 추이 (3년)",
+                height=400,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            fig_kr.update_yaxes(title_text="지수 / 금리차", secondary_y=False)
+            fig_kr.update_yaxes(title_text="KOSPI", secondary_y=True)
+            st.plotly_chart(fig_kr, use_container_width=True)
+    else:
+        if not bok_key:
+            st.info("한국은행 ECOS API 키가 필요합니다. (KOSPI는 API 키 없이 조회 가능)")
+        else:
+            st.info("한국 경기선행지수 데이터를 불러올 수 없습니다.")
+
+    # 해석 가이드
+    st.markdown("---")
+    with st.expander("경기선행지수 해석 가이드"):
+        st.markdown("""
+**장단기 금리차 (Yield Spread)**
+- 장기금리(10년) - 단기금리(3개월 또는 3년)
+- **양수**: 정상적인 수익률 곡선, 경기 확장 신호
+- **음수(역전)**: 경기 침체 선행 신호 (보통 12~18개월 전 예고)
+
+**경제심리지수 (ESI)**
+- 기준선: 100
+- **100 초과**: 경기 낙관, 소비·투자 증가 예상
+- **100 미만**: 경기 비관, 경제활동 위축 예상
+
+**실질 M2 통화공급**
+- 인플레이션 조정된 화폐 공급량
+- **증가**: 유동성 확대, 자산가격 상승 지지
+- **감소**: 긴축적 금융환경, 경기 둔화 가능성
+
+**국제원자재가격지수**
+- **상승**: 인플레이션 압력, 기업 비용 증가
+- **하락**: 디플레이션 압력, 경기 둔화 신호
+
+**주가지수 (S&P 500 / KOSPI)**
+- 경기를 6~9개월 선행
+- **상승**: 기업 실적 개선 기대, 경기 확장 예상
+- **하락**: 경기 둔화 예상
+        """)
+
+# --- AI Regime 전략 탭 ---
+with tab_regime:
+    st.subheader("🤖 AI Regime 전략 — 구조적 레짐 전환 분석")
+    st.caption("2028 AI Crisis 시나리오(CitriniResearch) 기반 KOSPI200 포지션 맵")
+
+    regime_sub1, regime_sub2, regime_sub3, regime_sub4 = st.tabs([
+        "📋 시나리오 개요", "🏭 산업 분류", "🗺️ 포지션 맵", "📡 실시간 모니터"
+    ])
+    _sector_df = build_sector_dataframe()
+
+    # ── 시나리오 개요 ──
+    with regime_sub1:
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("S&P 500 하락폭", "-38%", delta="-38%", delta_color="inverse")
+        with col2:
+            st.metric("실업률 시나리오", "10.2%", delta="+0.3%p 서프라이즈", delta_color="inverse")
+        with col3:
+            st.metric("노동소득 비중 변화", "56% → 46%", delta="-10%p (4년)", delta_color="inverse")
+        with col4:
+            st.metric("한국 포지셔닝", "AI 인프라 Convex", delta="반도체/전력 수혜")
+
+        st.divider()
+        st.plotly_chart(plot_scenario_timeline(), use_container_width=True)
+        st.divider()
+
+        _col_l, _col_r = st.columns([1, 1])
+        with _col_l:
+            st.markdown("### Intelligence Displacement Spiral")
+            st.plotly_chart(plot_displacement_spiral(), use_container_width=True)
+        with _col_r:
+            st.markdown("### 핵심 전달 메커니즘")
+            st.markdown("""
+**1단계: AI 능력 도약** (2025 Q4~)
+- 에이전틱 코딩 → SaaS 내재화 가능
+- CIO: "직접 만들면 안 되나?"
+
+**2단계: 고용 → 소비 연쇄** (2026~)
+- 화이트칼라 해고 → 하향취업
+- 상위 10% 소득자 = 소비의 50%+
+- 2% 고용 감소 → 3~4% 재량소비 감소
+
+**3단계: 금융 전이** (2027~)
+- SaaS ARR 해체 → 사모 신용 디폴트
+- 중개 마진 붕괴 (DoorDash, 카드, 보험)
+- 프라임 모기지 위기 조짐
+
+**4단계: 피드백 루프 가속**
+- 기존 통화정책 무력화
+- AI가 $180K PM 업무를 $200/월에 수행 → 금리 인하로 해결 불가
+            """)
+
+        st.divider()
+        st.markdown("### 한국 시장 특수성")
+        _kr1, _kr2 = st.columns(2)
+        with _kr1:
+            st.markdown("""
+**🟢 긍정 요인 (AI 인프라 Convex)**
+- 반도체: 삼성전자·SK하이닉스 (HBM/GPU)
+- 전력기기: HD현대일렉트릭, LS일렉트릭
+- 시나리오 내 "Taiwan and Korea outperformed massively"
+- 데이터센터 건설 수요 → 전력·냉각·네트워크
+            """)
+        with _kr2:
+            st.markdown("""
+**🔴 부정 요인 (대체 위험)**
+- IT 서비스/플랫폼: 카카오·네이버 중개 모델
+- 금융 중개: 카드·보험 수수료 구조
+- 부동산: 판교·강남 = 한국의 SF/시애틀
+- 경기소비재: 백화점·면세 고소득 의존
+            """)
+
+    # ── 산업 분류 ──
+    with regime_sub2:
+        st.plotly_chart(plot_sensitivity_bar(_sector_df), use_container_width=True)
+        st.divider()
+
+        _pos_filter = st.multiselect(
+            "포지션 필터", ["LONG", "SHORT", "NEUTRAL"],
+            default=["LONG", "SHORT", "NEUTRAL"], key="ai_pos_filter",
+        )
+        _filtered = _sector_df[_sector_df["포지션"].isin(_pos_filter)]
+
+        for _sec in _filtered["섹터"].unique():
+            _si = KOSPI200_SECTOR_MAP[_sec]
+            _pe = {"LONG": "🟢", "SHORT": "🔴", "NEUTRAL": "🟡"}[_si["position"]]
+            with st.expander(f"{_pe} **{_sec}** — 민감도 {_si['sensitivity']} | {_si['position']} | {_si['regime_role']}"):
+                st.markdown(f"**근거:** {_si['rationale']}")
+                st.dataframe(
+                    pd.DataFrame([{"종목코드": k, "종목명": v} for k, v in _si["tickers"].items()]),
+                    use_container_width=True, hide_index=True,
+                )
+
+        st.divider()
+        st.subheader("전체 종목 분류표")
+        _disp = _filtered[["포지션", "레짐역할", "섹터", "종목코드", "종목명", "AI대체민감도"]].copy()
+        _disp = _disp.sort_values(["포지션", "AI대체민감도"], ascending=[True, False])
+
+        def _hl_pos(row):
+            _c = {"LONG": "background-color: rgba(0,200,83,0.15)",
+                  "SHORT": "background-color: rgba(255,23,68,0.15)",
+                  "NEUTRAL": "background-color: rgba(255,214,0,0.15)"}
+            return [_c.get(row["포지션"], "")] * len(row)
+
+        st.dataframe(_disp.style.apply(_hl_pos, axis=1), use_container_width=True, height=600, hide_index=True)
+        st.download_button("CSV 다운로드", _disp.to_csv(index=False).encode("utf-8-sig"),
+                           "ai_regime_classification.csv", "text/csv", key="dl_regime")
+
+    # ── 포지션 맵 ──
+    with regime_sub3:
+        st.plotly_chart(plot_position_treemap(_sector_df), use_container_width=True)
+        st.divider()
+        st.subheader("포지션 요약")
+        _cl, _cs, _cn = st.columns(3)
+        _long_s = [s for s, v in KOSPI200_SECTOR_MAP.items() if v["position"] == "LONG"]
+        _short_s = [s for s, v in KOSPI200_SECTOR_MAP.items() if v["position"] == "SHORT"]
+        _neut_s = [s for s, v in KOSPI200_SECTOR_MAP.items() if v["position"] == "NEUTRAL"]
+        with _cl:
+            st.markdown("### 🟢 LONG (매수)")
+            for _s in _long_s:
+                _i = KOSPI200_SECTOR_MAP[_s]
+                st.markdown(f"**{_s}** (민감도 {_i['sensitivity']})")
+                st.caption(", ".join(_i["tickers"].values()))
+        with _cs:
+            st.markdown("### 🔴 SHORT (매도/회피)")
+            for _s in _short_s:
+                _i = KOSPI200_SECTOR_MAP[_s]
+                st.markdown(f"**{_s}** (민감도 {_i['sensitivity']})")
+                st.caption(", ".join(_i["tickers"].values()))
+        with _cn:
+            st.markdown("### 🟡 NEUTRAL (선별)")
+            for _s in _neut_s:
+                _i = KOSPI200_SECTOR_MAP[_s]
+                st.markdown(f"**{_s}** (민감도 {_i['sensitivity']})")
+                st.caption(", ".join(_i["tickers"].values()))
+
+        st.divider()
+        st.markdown("""### 전략 가이드라인
+| 구분 | 전략 | 핵심 논리 |
+|------|------|-----------|
+| **LONG** | AI 인프라 구축 수혜 | GPU/HBM, 전력기기, 데이터센터 → 컴퓨트 수요 구조적 증가 |
+| **SHORT** | 노동 대체 민감 섹터 회피 | SaaS, 중개/플랫폼, 카드, 보험 → 인건비 기반 비즈니스 모델 해체 |
+| **NEUTRAL** | 개별 종목 선별 | 자동차(자율주행 수혜 vs 소비 위축), 소재(IDC 수요 vs 경기둔화) |
+| **방어** | 필수소비·헬스케어 | 경기 방어적 특성, 다만 에이전트 가격 최적화로 마진 압박 가능 |
+        """)
+
+    # ── 실시간 모니터 ──
+    with regime_sub4:
+        st.caption("KOSPI200 대표 종목의 실시간 가격 기반 레짐 모멘텀 분석")
+        _lookback = st.selectbox("분석 기간", [20, 40, 60, 120], index=2, key="regime_lookback",
+                                 format_func=lambda x: f"{x}거래일 (~{x//20}개월)")
+        with st.spinner("시장 데이터 조회 중..."):
+            _all_codes = _sector_df["종목코드"].unique().tolist()
+            _prices = fetch_sector_prices(_all_codes, days=_lookback)
+
+        if not _prices.empty:
+            _momentum = compute_regime_momentum(_prices, _sector_df)
+            if not _momentum.empty:
+                _sfig = plot_regime_scatter(_momentum)
+                if _sfig:
+                    st.plotly_chart(_sfig, use_container_width=True)
+
+                st.divider()
+                st.subheader("섹터별 모멘텀 대시보드")
+                _sort_col = st.selectbox("정렬 기준",
+                    ["AI대체민감도", "1개월수익률(%)", "단기모멘텀(%)", "장기모멘텀(%)"], key="regime_sort")
+                _sort_asc = st.checkbox("오름차순", value=False, key="regime_sort_asc")
+                _msorted = _momentum.sort_values(_sort_col, ascending=_sort_asc)
+
+                def _cm(val):
+                    if pd.isna(val): return ""
+                    return "color: #00C853" if val > 0 else ("color: #FF1744" if val < 0 else "")
+
+                def _cp(val):
+                    return {"LONG": "color: #00C853; font-weight: bold",
+                            "SHORT": "color: #FF1744; font-weight: bold",
+                            "NEUTRAL": "color: #FFD600; font-weight: bold"}.get(val, "")
+
+                _styled = _msorted.style \
+                    .map(_cm, subset=["단기모멘텀(%)", "장기모멘텀(%)", "1개월수익률(%)"]) \
+                    .map(_cp, subset=["포지션"]) \
+                    .format({"단기모멘텀(%)": "{:+.1f}", "장기모멘텀(%)": "{:+.1f}",
+                             "1개월수익률(%)": "{:+.1f}"}, na_rep="-")
+                st.dataframe(_styled, use_container_width=True, height=500, hide_index=True)
+
+                st.divider()
+                st.subheader("포지션별 평균 성과")
+                _pa = _momentum.groupby("포지션").agg({
+                    "1개월수익률(%)": "mean", "단기모멘텀(%)": "mean",
+                    "장기모멘텀(%)": "mean", "AI대체민감도": "mean", "섹터": "count",
+                }).rename(columns={"섹터": "섹터수"}).reset_index()
+                _cfig = go.Figure()
+                _cmap = {"LONG": "#00C853", "SHORT": "#FF1744", "NEUTRAL": "#FFD600"}
+                for _, _r in _pa.iterrows():
+                    _cfig.add_trace(go.Bar(
+                        x=[_r["포지션"]], y=[_r["1개월수익률(%)"]],
+                        name=_r["포지션"], marker_color=_cmap.get(_r["포지션"], "#8B949E"),
+                        text=f'{_r["1개월수익률(%)"]:.1f}%', textposition="outside",
+                    ))
+                _cfig.update_layout(
+                    title="포지션별 평균 1개월 수익률", yaxis_title="수익률 (%)", height=350,
+                    plot_bgcolor="#0D1117", paper_bgcolor="#0D1117", font=dict(color="#E6EDF3"),
+                    yaxis=dict(gridcolor="#30363D", zeroline=True, zerolinecolor="#8B949E"),
+                    showlegend=False,
+                )
+                st.plotly_chart(_cfig, use_container_width=True)
+
+                # LONG-SHORT 스프레드
+                _lr = _momentum[_momentum["포지션"] == "LONG"]["1개월수익률(%)"].mean()
+                _sr = _momentum[_momentum["포지션"] == "SHORT"]["1개월수익률(%)"].mean()
+                _sp = _lr - _sr if pd.notna(_lr) and pd.notna(_sr) else None
+                if _sp is not None:
+                    st.markdown(f"""
+                    <div style="text-align:center; padding:1.5rem; background:#161B22; border-radius:8px; border:1px solid #30363D;">
+                        <div style="color:#8B949E; font-size:0.9rem;">LONG-SHORT 스프레드 (1개월)</div>
+                        <div style="font-size:2rem; font-weight:bold; color:{'#00C853' if _sp > 0 else '#FF1744'};">{_sp:+.1f}%p</div>
+                        <div style="color:#8B949E; font-size:0.8rem;">LONG 평균: {_lr:+.1f}% | SHORT 평균: {_sr:+.1f}%</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+        else:
+            st.warning("시장 데이터를 조회하지 못했습니다. 잠시 후 다시 시도해주세요.")
+
+        st.divider()
+        with st.expander("⚠️ 면책 고지"):
+            st.markdown("""
+본 분석은 **CitriniResearch의 가상 시나리오**에 기반한 교육적·연구적 목적의 레짐 분석 도구입니다.
+- 이 시나리오는 **예측이 아닌 시뮬레이션**입니다
+- 실제 투자 결정은 개인의 판단과 책임 하에 이루어져야 합니다
+- AI 대체 민감도 점수는 정성적 평가이며, 정량 모델의 결과가 아닙니다
+- 과거 수익률은 미래 성과를 보장하지 않습니다
+            """)
